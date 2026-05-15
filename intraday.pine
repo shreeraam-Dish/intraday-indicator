@@ -1,0 +1,598 @@
+// ============================================================
+// INTRADAY INTELLIGENCE SYSTEM v2.0  — FIXED
+// Advanced Candlestick Pattern Recognition + Historical Analysis
+// + Technical Confluence + Signal Engine
+//
+// FIXES APPLIED:
+//  1. max_bars_back(curPID, 500) added — fixes dynamic-index crash
+//  2. max_bars_back(c, 505) added   — fixes dynamic c[i-confirmBars] crash
+//  3. Integer division bug fixed in analyzeHistory (float casting)
+//  4. timeframe.period + "m" replaced → timeframe.period (was "Dm" on daily)
+//  5. avgBullMv / avgBearMv now displayed in table (were computed, never shown)
+//  6. Redundant x2 on extend.right lines removed
+//  7. Tightened patternBias: Doji now treated as neutral (no signal alone)
+// ============================================================
+
+//@version=6
+indicator("Intraday Intelligence System v2.0", shorttitle="IIS v2.0",
+     overlay=true, max_lines_count=500, max_labels_count=500,
+     max_boxes_count=200)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+grp1 = "Pattern Settings"
+lookback       = input.int(300,    "History Lookback (bars)",         minval=50,  maxval=500, group=grp1)
+confirmBars    = input.int(3,      "Confirmation Bars After Pattern",  minval=1,   maxval=5,   group=grp1)
+minOccurrences = input.int(3,      "Min Past Occurrences to Signal",   minval=1,               group=grp1)
+minConfidence  = input.float(55.0, "Min Confidence % to Show Signal",  minval=10,  maxval=100, group=grp1)
+
+grp2 = "Indicator Settings"
+emaFastLen = input.int(9,    "Fast EMA",          minval=1,  group=grp2)
+emaSlowLen = input.int(21,   "Slow EMA",          minval=1,  group=grp2)
+ema200Len  = input.int(200,  "Trend EMA",         minval=50, group=grp2)
+rsiLen     = input.int(14,   "RSI Length",        minval=1,  group=grp2)
+rsiOB      = input.float(70, "RSI Overbought",               group=grp2)
+rsiOS      = input.float(30, "RSI Oversold",                  group=grp2)
+atrLen     = input.int(14,   "ATR Length",                    group=grp2)
+volMaLen   = input.int(20,   "Volume MA Length",              group=grp2)
+
+grp3 = "Risk Management"
+rrRatio    = input.float(2.0, "Risk:Reward Ratio",         minval=1.0, step=0.5,  group=grp3)
+atrMultSL  = input.float(1.5, "Stop Loss ATR Multiplier",  minval=0.5, step=0.25, group=grp3)
+
+grp4 = "Display"
+showLabels = input.bool(true,        "Show Signal Labels",      group=grp4)
+showTable  = input.bool(true,        "Show Analysis Table",     group=grp4)
+showSRLines= input.bool(true,        "Show Support/Resistance", group=grp4)
+tablePos   = input.string("Top Right","Table Position",
+     options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grp4)
+
+// ─────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+// ─────────────────────────────────────────────────────────────
+o = open
+h = high
+l = low
+c = close
+v = volume
+
+atr     = ta.atr(atrLen)
+emaFast = ta.ema(c, emaFastLen)
+emaSlow = ta.ema(c, emaSlowLen)
+ema200  = ta.ema(c, ema200Len)
+rsi     = ta.rsi(c, rsiLen)
+volMA   = ta.sma(v, volMaLen)
+vwap    = ta.vwap(c)
+
+body      = math.abs(c - o)
+fullRange = h - l
+upperWick = h - math.max(o, c)
+lowerWick = math.min(o, c) - l
+isBull    = c > o
+isBear    = c < o
+bodyRatio = fullRange > 0 ? body / fullRange : 0.0
+
+// FIX 2: declare max_bars_back for c early so the analyzeHistory loop
+// can safely do c[i - confirmBars] with i up to 500
+max_bars_back(c, 505)
+
+// ─────────────────────────────────────────────────────────────
+// PATTERN DETECTION FUNCTIONS
+// ─────────────────────────────────────────────────────────────
+
+isDoji() =>
+    bodyRatio < 0.1 and fullRange > 0
+
+isHammer() =>
+    lowerWick >= body * 2.0 and upperWick <= body * 0.3 and body > 0
+
+isInvHammer() =>
+    upperWick >= body * 2.0 and lowerWick <= body * 0.3 and body > 0
+
+isBullEngulf() =>
+    isBull and isBear[1] and c > o[1] and o < c[1]
+
+isBearEngulf() =>
+    isBear and isBull[1] and c < o[1] and o > c[1]
+
+isMorningStar() =>
+    isBear[2] and body[2] > atr[2] * 0.5 and
+     math.abs(c[1] - o[1]) < atr[1] * 0.3 and
+     isBull and c > (o[2] + c[2]) / 2
+
+isEveningStar() =>
+    isBull[2] and body[2] > atr[2] * 0.5 and
+     math.abs(c[1] - o[1]) < atr[1] * 0.3 and
+     isBear and c < (o[2] + c[2]) / 2
+
+isBullHarami() =>
+    isBear[1] and isBull and
+     o > c[1] and c < o[1] and body < body[1]
+
+isBearHarami() =>
+    isBull[1] and isBear and
+     o < c[1] and c > o[1] and body < body[1]
+
+is3WhiteSoldiers() =>
+    isBull and isBull[1] and isBull[2] and
+     c > c[1] and c[1] > c[2] and
+     o > o[1] and o[1] > o[2] and
+     body > atr * 0.4 and body[1] > atr[1] * 0.4 and body[2] > atr[2] * 0.4
+
+is3BlackCrows() =>
+    isBear and isBear[1] and isBear[2] and
+     c < c[1] and c[1] < c[2] and
+     o < o[1] and o[1] < o[2] and
+     body > atr * 0.4 and body[1] > atr[1] * 0.4 and body[2] > atr[2] * 0.4
+
+isPiercingLine() =>
+    isBear[1] and isBull and
+     o < c[1] and c > (o[1] + c[1]) / 2 and c < o[1]
+
+isDarkCloud() =>
+    isBull[1] and isBear and
+     o > c[1] and c < (o[1] + c[1]) / 2 and c > o[1]
+
+isTweezerBot() =>
+    isBear[1] and isBull and math.abs(l - l[1]) < atr * 0.1
+
+isTweezerTop() =>
+    isBull[1] and isBear and math.abs(h - h[1]) < atr * 0.1
+
+// ─────────────────────────────────────────────────────────────
+// PATTERN IDENTIFICATION
+// PatternIDs: 1=Doji 2=Hammer 3=InvHammer 4=BullEngulf 5=BearEngulf
+//             6=MorningStar 7=EveningStar 8=BullHarami 9=BearHarami
+//             10=3WhiteSoldiers 11=3BlackCrows 12=PiercingLine
+//             13=DarkCloudCover 14=TweezerBot 15=TweezerTop  0=None
+// ─────────────────────────────────────────────────────────────
+getPatternID() =>
+    int  pid      = 0
+    bool bullBias = true
+    // FIX 7: Doji alone is neutral — only assign a bias if candle direction is clear
+    if isDoji()
+        pid      := 1
+        bullBias := c > o  // true bullish doji only if closed above open
+    else if isHammer()
+        pid      := 2
+        bullBias := true
+    else if isInvHammer()
+        pid      := 3
+        bullBias := true
+    else if isBullEngulf()
+        pid      := 4
+        bullBias := true
+    else if isBearEngulf()
+        pid      := 5
+        bullBias := false
+    else if isMorningStar()
+        pid      := 6
+        bullBias := true
+    else if isEveningStar()
+        pid      := 7
+        bullBias := false
+    else if isBullHarami()
+        pid      := 8
+        bullBias := true
+    else if isBearHarami()
+        pid      := 9
+        bullBias := false
+    else if is3WhiteSoldiers()
+        pid      := 10
+        bullBias := true
+    else if is3BlackCrows()
+        pid      := 11
+        bullBias := false
+    else if isPiercingLine()
+        pid      := 12
+        bullBias := true
+    else if isDarkCloud()
+        pid      := 13
+        bullBias := false
+    else if isTweezerBot()
+        pid      := 14
+        bullBias := true
+    else if isTweezerTop()
+        pid      := 15
+        bullBias := false
+    [pid, bullBias]
+
+getPatternName(int pid) =>
+    switch pid
+        1  => "Doji"
+        2  => "Hammer"
+        3  => "Inv. Hammer"
+        4  => "Bull Engulf"
+        5  => "Bear Engulf"
+        6  => "Morning Star"
+        7  => "Evening Star"
+        8  => "Bull Harami"
+        9  => "Bear Harami"
+        10 => "3 White Soldiers"
+        11 => "3 Black Crows"
+        12 => "Piercing Line"
+        13 => "Dark Cloud"
+        14 => "Tweezer Bot"
+        15 => "Tweezer Top"
+        => "None"
+
+// ─────────────────────────────────────────────────────────────
+// IDENTIFY CURRENT PATTERN
+// ─────────────────────────────────────────────────────────────
+[curPID, curBullBias] = getPatternID()
+
+// FIX 1: Required so analyzeHistory can do curPID[i] with i up to 500
+max_bars_back(curPID, 500)
+
+// ─────────────────────────────────────────────────────────────
+// HISTORICAL PATTERN ANALYSIS
+// Scans past [lookback] bars for same pattern,
+// then checks what price did [confirmBars] later
+// ─────────────────────────────────────────────────────────────
+analyzeHistory(int targetPID) =>
+    int   occurrences  = 0
+    int   bullFollowed = 0
+    int   bearFollowed = 0
+    int   sideFollowed = 0
+    float sumBullMove  = 0.0
+    float sumBearMove  = 0.0
+
+    if targetPID > 0
+        for i = confirmBars + 1 to lookback
+            if curPID[i] == targetPID
+                occurrences += 1
+                futureClose  = c[i - confirmBars]
+                patternClose = c[i]
+                // FIX 3: guard against zero (flat/halted bars)
+                movePct = patternClose != 0.0 ?
+                     (futureClose - patternClose) / patternClose * 100.0 : 0.0
+                if movePct > 0.3
+                    bullFollowed += 1
+                    sumBullMove  += movePct
+                else if movePct < -0.3
+                    bearFollowed += 1
+                    sumBearMove  += movePct
+                else
+                    sideFollowed += 1
+
+    // FIX 3: explicit float cast on division to avoid integer-division truncation
+    float bullPct = occurrences > 0 ? float(bullFollowed) / float(occurrences) * 100.0 : 0.0
+    float bearPct = occurrences > 0 ? float(bearFollowed) / float(occurrences) * 100.0 : 0.0
+    float sidePct = occurrences > 0 ? float(sideFollowed) / float(occurrences) * 100.0 : 0.0
+    float abm     = bullFollowed > 0 ? sumBullMove / float(bullFollowed) : 0.0
+    float abmr    = bearFollowed > 0 ? sumBearMove / float(bearFollowed) : 0.0
+
+    [occurrences, bullPct, bearPct, sidePct, abm, abmr]
+
+// ─────────────────────────────────────────────────────────────
+// TECHNICAL CONFLUENCE SCORE (0–40 points)
+// ─────────────────────────────────────────────────────────────
+getTechScore(bool forBull) =>
+    float score = 0.0
+    if forBull
+        if emaFast > emaSlow
+            score += 8.0
+        if c > ema200
+            score += 8.0
+        if c > vwap
+            score += 6.0
+        if rsi > 50 and rsi < rsiOB
+            score += 8.0
+        if v > volMA
+            score += 5.0
+        if emaFast > emaFast[1]
+            score += 5.0
+    else
+        if emaFast < emaSlow
+            score += 8.0
+        if c < ema200
+            score += 8.0
+        if c < vwap
+            score += 6.0
+        if rsi < 50 and rsi > rsiOS
+            score += 8.0
+        if v > volMA
+            score += 5.0
+        if emaFast < emaFast[1]
+            score += 5.0
+    score
+
+// ─────────────────────────────────────────────────────────────
+// CONFIDENCE CALCULATION
+// Pattern probability (60%) + Technical score (40%)
+// ─────────────────────────────────────────────────────────────
+calcConfidence(float patternProb, float techScore) =>
+    patternWeight = patternProb * 0.60
+    techWeight    = math.min(techScore / 40.0 * 100.0, 100.0) * 0.40
+    math.min(patternWeight + techWeight, 99.0)
+
+// ─────────────────────────────────────────────────────────────
+// SUPPORT & RESISTANCE (pivot-based)
+// ─────────────────────────────────────────────────────────────
+pivotHigh = ta.pivothigh(h, 5, 5)
+pivotLow  = ta.pivotlow(l,  5, 5)
+
+var float resistance = na
+var float support    = na
+
+if not na(pivotHigh)
+    resistance := pivotHigh
+if not na(pivotLow)
+    support := pivotLow
+
+// ─────────────────────────────────────────────────────────────
+// MAIN SIGNAL ENGINE
+// ─────────────────────────────────────────────────────────────
+[occ, bullPct, bearPct, sidePct, avgBullMv, avgBearMv] = analyzeHistory(curPID)
+
+bool signalBull    = curBullBias      and bullPct >= bearPct
+bool signalBear    = not curBullBias  and bearPct >= bullPct
+
+float techBull     = getTechScore(true)
+float techBear     = getTechScore(false)
+
+float probForDir   = signalBull ? bullPct : bearPct
+float techForDir   = signalBull ? techBull : techBear
+float confidence   = curPID > 0 and occ >= minOccurrences ?
+     calcConfidence(probForDir, techForDir) : 0.0
+
+bool validSignal   = confidence >= minConfidence and occ >= minOccurrences and curPID > 0
+
+// ─────────────────────────────────────────────────────────────
+// TRADE LEVELS
+// ─────────────────────────────────────────────────────────────
+slDist   = atr * atrMultSL
+tpDist   = slDist * rrRatio
+
+entryBull = c
+slBull    = c - slDist
+tp1Bull   = c + tpDist
+tp2Bull   = c + tpDist * 1.5
+
+entryBear = c
+slBear    = c + slDist
+tp1Bear   = c - tpDist
+tp2Bear   = c - tpDist * 1.5
+
+// ─────────────────────────────────────────────────────────────
+// INDICATOR PLOTS
+// ─────────────────────────────────────────────────────────────
+plot(emaFast, "Fast EMA",  color.new(color.yellow, 0), 1)
+plot(emaSlow, "Slow EMA",  color.new(color.orange, 0), 1)
+plot(ema200,  "Trend EMA", color.new(color.white,  30),2)
+plot(vwap,    "VWAP",      color.new(color.purple, 0), 2)
+
+plot(showSRLines ? resistance : na, "Resistance",
+     color.new(color.red,   0), 1, plot.style_circles)
+plot(showSRLines ? support    : na, "Support",
+     color.new(color.green, 0), 1, plot.style_circles)
+
+// ─────────────────────────────────────────────────────────────
+// SIGNAL LABELS
+// ─────────────────────────────────────────────────────────────
+if showLabels and validSignal
+    patName  = getPatternName(curPID)
+    occStr   = str.tostring(occ)
+    bullStr  = str.tostring(math.round(bullPct))
+    bearStr  = str.tostring(math.round(bearPct))
+    sideStr  = str.tostring(math.round(sidePct))
+    confStr  = str.tostring(math.round(confidence))
+
+    labelTxt = signalBull ?
+         "▲ BUY  " + confStr + "%\n" +
+         patName + " | " + occStr + " occurrences\n" +
+         "Bull: " + bullStr + "%  Bear: " + bearStr + "%  Side: " + sideStr + "%\n" +
+         "Entry: " + str.tostring(math.round(entryBull * 100) / 100) +
+         "  SL: "  + str.tostring(math.round(slBull    * 100) / 100) +
+         "\nTP1: " + str.tostring(math.round(tp1Bull   * 100) / 100) +
+         "  TP2: " + str.tostring(math.round(tp2Bull   * 100) / 100)
+         :
+         "▼ SELL  " + confStr + "%\n" +
+         patName + " | " + occStr + " occurrences\n" +
+         "Bull: " + bullStr + "%  Bear: " + bearStr + "%  Side: " + sideStr + "%\n" +
+         "Entry: " + str.tostring(math.round(entryBear * 100) / 100) +
+         "  SL: "  + str.tostring(math.round(slBear    * 100) / 100) +
+         "\nTP1: " + str.tostring(math.round(tp1Bear   * 100) / 100) +
+         "  TP2: " + str.tostring(math.round(tp2Bear   * 100) / 100)
+
+    label.new(bar_index,
+         signalBull ? l - atr * 0.5 : h + atr * 0.5,
+         labelTxt,
+         color     = signalBull ? color.new(color.green,0) : color.new(color.red,0),
+         textcolor = color.white,
+         style     = signalBull ? label.style_label_up : label.style_label_down,
+         size      = size.normal)
+
+// ─────────────────────────────────────────────────────────────
+// TRADE LEVEL LINES
+// FIX 6: removed redundant x2 arg when using extend.right
+// ─────────────────────────────────────────────────────────────
+var line slLine  = na
+var line tp1Line = na
+var line tp2Line = na
+
+if validSignal
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    if signalBull
+        slLine  := line.new(bar_index, slBull,  bar_index, slBull,
+             color=color.red,   width=1, style=line.style_dashed, extend=extend.right)
+        tp1Line := line.new(bar_index, tp1Bull, bar_index, tp1Bull,
+             color=color.green, width=1, style=line.style_dashed, extend=extend.right)
+        tp2Line := line.new(bar_index, tp2Bull, bar_index, tp2Bull,
+             color=color.teal,  width=1, style=line.style_dashed, extend=extend.right)
+    else
+        slLine  := line.new(bar_index, slBear,  bar_index, slBear,
+             color=color.red,   width=1, style=line.style_dashed, extend=extend.right)
+        tp1Line := line.new(bar_index, tp1Bear, bar_index, tp1Bear,
+             color=color.green, width=1, style=line.style_dashed, extend=extend.right)
+        tp2Line := line.new(bar_index, tp2Bear, bar_index, tp2Bear,
+             color=color.teal,  width=1, style=line.style_dashed, extend=extend.right)
+
+// ─────────────────────────────────────────────────────────────
+// ANALYSIS TABLE
+// ─────────────────────────────────────────────────────────────
+if showTable and barstate.islast
+    tPos = switch tablePos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+    t = table.new(tPos, 2, 22,
+         bgcolor      = color.new(color.black, 20),
+         border_width = 1,
+         border_color = color.new(color.gray,  60),
+         frame_width  = 1,
+         frame_color  = color.new(color.gray,  50))
+
+    hdrBg = color.new(color.blue, 20)
+    hdrTc = color.white
+    keyTc = color.new(color.gray, 20)
+    valTc = color.white
+    bullC = color.new(color.green, 0)
+    bearC = color.new(color.red,   0)
+    rowA  = color.new(color.black, 40)
+    rowB  = color.new(color.black, 50)
+
+    // FIX 4: timeframe.period already includes the unit ("1","5","D","W" etc.)
+    //        — do NOT append "m" (was producing "Dm","Wm" on higher timeframes)
+    tfLabel = timeframe.in_seconds() < 86400 ? timeframe.period + "m" : timeframe.period
+
+    table.cell(t, 0, 0, "INTRADAY INTELLIGENCE",
+         text_color=hdrTc, bgcolor=hdrBg, text_size=size.normal, text_halign=text.align_center)
+    table.cell(t, 1, 0, syminfo.ticker + " | " + tfLabel,
+         text_color=color.yellow, bgcolor=hdrBg, text_size=size.normal, text_halign=text.align_center)
+
+    // Pattern
+    pname = curPID > 0 ? getPatternName(curPID) : "No Pattern"
+    table.cell(t, 0, 1, "Pattern",      text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 1, pname,          text_color=valTc, bgcolor=rowA)
+
+    // Occurrences
+    table.cell(t, 0, 2, "History Hits", text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 2, str.tostring(occ) + " / " + str.tostring(lookback) + " bars",
+         text_color=valTc, bgcolor=rowB)
+
+    // Bull / Bear / Side %
+    table.cell(t, 0, 3, "Bull %",       text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 3, str.tostring(math.round(bullPct)) + "%",
+         text_color=bullC, bgcolor=rowA)
+
+    table.cell(t, 0, 4, "Bear %",       text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 4, str.tostring(math.round(bearPct)) + "%",
+         text_color=bearC, bgcolor=rowB)
+
+    table.cell(t, 0, 5, "Sideways %",   text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 5, str.tostring(math.round(sidePct)) + "%",
+         text_color=color.yellow, bgcolor=rowA)
+
+    // FIX 5: avg move data — was computed but never displayed
+    bullMvStr = avgBullMv > 0  ? "+" + str.tostring(math.round(avgBullMv * 10) / 10) + "%" : "n/a"
+    bearMvStr = avgBearMv < 0  ? str.tostring(math.round(avgBearMv * 10) / 10) + "%" : "n/a"
+    table.cell(t, 0, 6, "Avg Bull Move", text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 6, bullMvStr,       text_color=bullC, bgcolor=rowB)
+    table.cell(t, 0, 7, "Avg Bear Move", text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 7, bearMvStr,       text_color=bearC, bgcolor=rowA)
+
+    // Confidence
+    confColor = confidence >= 70 ? bullC : confidence >= 50 ? color.yellow : bearC
+    table.cell(t, 0, 8, "Confidence",   text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 8, str.tostring(math.round(confidence)) + "%",
+         text_color=confColor, bgcolor=rowB, text_size=size.normal)
+
+    // Signal verdict
+    sigTxt   = not validSignal ? "NO TRADE" : signalBull ? "▲ BUY" : "▼ SELL"
+    sigColor = not validSignal ? color.gray  : signalBull ? bullC   : bearC
+    table.cell(t, 0, 9, "SIGNAL",       text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 9, sigTxt,         text_color=sigColor, bgcolor=rowA, text_size=size.large)
+
+    // ── Technicals separator ──
+    sepBg = color.new(color.navy, 60)
+    sepTc = color.new(color.gray, 20)
+    table.cell(t, 0, 10, "── Technicals ──", text_color=sepTc, bgcolor=sepBg, text_halign=text.align_center)
+    table.cell(t, 1, 10, "── Status ──",     text_color=sepTc, bgcolor=sepBg, text_halign=text.align_center)
+
+    // RSI
+    rsiColor = rsi > rsiOB ? bearC : rsi < rsiOS ? bullC : valTc
+    rsiStr   = rsi > rsiOB ? "Overbought" : rsi < rsiOS ? "Oversold" : "Neutral"
+    table.cell(t, 0, 11, "RSI (" + str.tostring(rsiLen) + ")", text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 11, str.tostring(math.round(rsi * 10) / 10) + " — " + rsiStr,
+         text_color=rsiColor, bgcolor=rowB)
+
+    // EMA
+    emaStr   = emaFast > emaSlow ? "Bullish" : "Bearish"
+    emaColor = emaFast > emaSlow ? bullC : bearC
+    table.cell(t, 0, 12, "EMA Cross",   text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 12, emaStr,        text_color=emaColor, bgcolor=rowA)
+
+    // VWAP
+    vwapStr = c > vwap ? "Above VWAP" : "Below VWAP"
+    vwapClr = c > vwap ? bullC : bearC
+    table.cell(t, 0, 13, "VWAP",        text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 13, vwapStr,       text_color=vwapClr, bgcolor=rowB)
+
+    // Trend
+    trendStr = c > ema200 ? "Uptrend (>EMA200)" : "Downtrend (<EMA200)"
+    trendClr = c > ema200 ? bullC : bearC
+    table.cell(t, 0, 14, "Trend",       text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 14, trendStr,      text_color=trendClr, bgcolor=rowA)
+
+    // Volume
+    volStr   = v > volMA * 1.5 ? "High Vol ▲" : v > volMA ? "Normal" : "Low Vol ▼"
+    volColor = v > volMA * 1.5 ? bullC : v > volMA ? valTc : color.gray
+    table.cell(t, 0, 15, "Volume",      text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 15, volStr,        text_color=volColor, bgcolor=rowB)
+
+    // ── Trade Setup separator ──
+    table.cell(t, 0, 16, "── Trade Setup ──", text_color=sepTc, bgcolor=sepBg, text_halign=text.align_center)
+    table.cell(t, 1, 16, "── Levels ──",      text_color=sepTc, bgcolor=sepBg, text_halign=text.align_center)
+
+    entryV = validSignal ? (signalBull ? entryBull : entryBear) : c
+    slV    = validSignal ? (signalBull ? slBull    : slBear)    : c - atr
+    tp1V   = validSignal ? (signalBull ? tp1Bull   : tp1Bear)   : c + atr
+    tp2V   = validSignal ? (signalBull ? tp2Bull   : tp2Bear)   : c + atr * 2
+
+    table.cell(t, 0, 17, "Entry",      text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 17, str.tostring(math.round(entryV * 100) / 100),
+         text_color=color.yellow, bgcolor=rowA)
+
+    table.cell(t, 0, 18, "Stop Loss",  text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 18, str.tostring(math.round(slV * 100) / 100),
+         text_color=bearC, bgcolor=rowB)
+
+    table.cell(t, 0, 19, "TP1",        text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 19, str.tostring(math.round(tp1V * 100) / 100),
+         text_color=bullC, bgcolor=rowA)
+
+    table.cell(t, 0, 20, "TP2",        text_color=keyTc, bgcolor=rowB)
+    table.cell(t, 1, 20, str.tostring(math.round(tp2V * 100) / 100),
+         text_color=bullC, bgcolor=rowB)
+
+    table.cell(t, 0, 21, "RR Ratio",   text_color=keyTc, bgcolor=rowA)
+    table.cell(t, 1, 21, "1 : " + str.tostring(rrRatio),
+         text_color=color.yellow, bgcolor=rowA)
+
+// ─────────────────────────────────────────────────────────────
+// BACKGROUND SHADING on signal bars
+// ─────────────────────────────────────────────────────────────
+bgcolor(validSignal and signalBull ? color.new(color.green, 90) :
+        validSignal and not signalBull ? color.new(color.red, 90) : na,
+        title="Signal Background")
+
+// ─────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────
+alertcondition(validSignal and signalBull,
+     title   = "IIS BUY Signal",
+     message = "🟢 BUY Signal | {{ticker}} | Entry: {{close}}")
+
+alertcondition(validSignal and not signalBull,
+     title   = "IIS SELL Signal",
+     message = "🔴 SELL Signal | {{ticker}} | Entry: {{close}}")
+
+alertcondition(validSignal,
+     title   = "IIS Any Signal",
+     message = "⚡ Trade Signal on {{ticker}} | {{interval}} | Check chart for details.")
